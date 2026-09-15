@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>GAMEVERSE — Multiplayer</title>
+<link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Inter:wght@300;400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+
+<div id="lobby">
+  <div class="lobby-box">
+    <h1 class="logo">🎮 GAME<span class="accent">VERSE</span></h1>
+    <p class="sub">Real-Time Multiplayer</p>
+    <input id="pname" placeholder="Your name..." maxlength="14">
+
+    <h2 class="sec-title">Select Game</h2>
+    <div class="gcards">
+      <div class="gcard sel" data-g="battleroyale">
+        <span class="gi">🔫</span><h3>Battle Royale</h3>
+        <p>Loot, shoot, survive the zone</p><span class="tag">2-30</span>
+      </div>
+      <div class="gcard" data-g="teamshooter">
+        <span class="gi">⚔️</span><h3>Team Deathmatch</h3>
+        <p>Red vs Blue, first to 25 kills</p><span class="tag">4-8</span>
+      </div>
+      <div class="gcard" data-g="ctf">
+        <span class="gi">🚩</span><h3>Capture the Flag</h3>
+        <p>Steal the flag, defend yours</p><span class="tag">4-10</span>
+      </div>
+      <div class="gcard" data-g="zombie">
+        <span class="gi">🧟</span><h3>Zombie Survival</h3>
+        <p>Co-op waves of undead</p><span class="tag">1-8</span>
+      </div>
+      <div class="gcard" data-g="deathmatch">
+        <span class="gi">💀</span><h3>Deathmatch</h3>
+        <p>FFA arena, grab powerups</p><span class="tag">2-12</span>
+      </div>
+      <div class="gcard" data-g="koth">
+        <span class="gi">👑</span><h3>King of the Hill</h3>
+        <p>Hold the zone to score</p><span class="tag">4-10</span>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button class="btn bp bl" id="bcreate">CREATE ROOM</button>
+      <div class="jrow">
+        <input id="rcode" placeholder="CODE" maxlength="6">
+        <button class="btn bs bl" id="bjoin">JOIN</button>
+      </div>
+    </div>
+
+    <div id="rwait" class="hidden">
+      <h2>ROOM <span id="dcode" class="accent"></span></h2>
+      <button class="btn bs sm" id="bcopy">📋 Copy</button>
+      <div id="plist"></div>
+      <button class="btn ba bl hidden" id="bstart">🚀 START</button>
+      <button class="btn bd sm" id="bleave">Leave</button>
+    </div>
+  </div>
+</div>
+
+<canvas id="cv" class="hidden"></canvas>
+
+<div id="hud" class="hidden">
+  <div id="hud-top">
+    <span id="h-score">Score: 0</span>
+    <span id="h-kills">Kills: 0</span>
+    <span id="h-alive">Alive: 0</span>
+    <span id="h-wave" class="hidden">Wave: 1</span>
+    <span id="h-tscore" class="hidden">Red 0 - 0 Blue</span>
+  </div>
+  <div id="h-hp"><div id="h-hpf"></div></div>
+  <div id="h-mm"><canvas id="mmc" width="140" height="140"></canvas></div>
+  <div id="h-wep">🔫 Pistol</div>
+  <div id="h-zone" class="hidden">Zone: <span id="h-zt">30</span>s</div>
+  <div id="h-flag" class="hidden">🚩 YOU HAVE THE FLAG!</div>
+</div>
+
+<div id="results" class="hidden">
+  <div class="rcard">
+    <h1 id="r-title">🏆 VICTORY</h1>
+    <div id="r-list"></div>
+    <button class="btn bp bl" id="rback">BACK TO LOBBY</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/js/client.js"></script>
+</body>
+</html>
