@@ -1,648 +1,301 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { v4: uuid } = require('uuid');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
-app.use(express.static('public'));
+const io = new Server(server);
+app.use(express.static(path.join(__dirname, 'public')));
 
-const TICK = 1000 / 60;
 const rooms = {};
+const MAP = 200;
 
-// ===================== CONFIGS =====================
-const CONFIGS = {
-  battleroyale: {
-    mapW: 3000, mapH: 3000, maxPlayers: 30,
-    hp: 100, speed: 3, bulletSpeed: 12, fireRate: 280,
-    zoneShrink: 25000, zoneDmg: 4, weaponSpawns: 30, healthSpawns: 15
-  },
-  teamshooter: {
-    mapW: 2000, mapH: 1500, maxPlayers: 8, perTeam: 4,
-    hp: 100, speed: 4, bulletSpeed: 14, fireRate: 180,
-    respawn: 3000, scoreToWin: 25
-  },
-  ctf: {
-    mapW: 2400, mapH: 1400, maxPlayers: 10, perTeam: 5,
-    hp: 100, speed: 3.5, bulletSpeed: 12, fireRate: 250,
-    respawn: 3000, capturesToWin: 3, flagReturnTime: 15000
-  },
-  zombie: {
-    mapW: 2000, mapH: 2000, maxPlayers: 8,
-    hp: 150, speed: 3.2, bulletSpeed: 13, fireRate: 200,
-    waveInterval: 5000, zombieSpeed: 1.2, zombieHp: 40, zombieDmg: 10,
-    zombiesPerWave: 8, waveGrowth: 4
-  },
-  deathmatch: {
-    mapW: 1600, mapH: 1600, maxPlayers: 12,
-    hp: 100, speed: 3.8, bulletSpeed: 13, fireRate: 200,
-    respawn: 2000, scoreToWin: 20, powerupInterval: 8000
-  },
-  koth: {
-    mapW: 1800, mapH: 1800, maxPlayers: 10, perTeam: 5,
-    hp: 100, speed: 3.5, bulletSpeed: 12, fireRate: 250,
-    respawn: 3000, scoreToWin: 100, hillRadius: 120, hillMoveInterval: 20000
-  }
-};
+function rid() { return Math.random().toString(36).substring(2, 7).toUpperCase(); }
+function d3(a, b) { return Math.sqrt((a.x-b.x)**2 + (a.y-b.y)**2 + (a.z-b.z)**2); }
+function rnd(a, b) { return a + Math.random() * (b - a); }
 
-// ===================== ROOM MGMT =====================
 io.on('connection', (socket) => {
-  let roomId = null, pName = null;
+  let room = null;
 
-  socket.on('createRoom', ({ name, gameType }, cb) => {
-    const id = uuid().slice(0, 6).toUpperCase();
+  socket.on('create', (data, cb) => {
+    const id = rid();
     rooms[id] = {
-      id, type: gameType, players: {}, state: 'lobby',
-      cfg: CONFIGS[gameType], tick: 0,
-      projectiles: [], pickups: [], entities: [],
-      zone: null, flags: null, hill: null, wave: 0,
-      teamScores: { red: 0, blue: 0 }, startTime: 0
+      id, type: data.type || 'battle',
+      players: {}, bullets: [], items: [],
+      state: 'lobby', scores: { red: 0, blue: 0 },
+      zone: null, wave: 0, zombies: [], loop: null
     };
-    roomId = id; pName = name || 'Player';
-    joinRoom(socket, rooms[id], pName);
-    cb({ ok: true, roomId: id });
+    room = id;
+    join(socket, rooms[id], data.name || 'Player', true);
+    cb({ ok: true, id });
   });
 
-  socket.on('joinRoom', ({ name, roomId: rid }, cb) => {
-    rid = rid.toUpperCase();
-    const r = rooms[rid];
-    if (!r) return cb({ ok: false, err: 'Room not found' });
-    if (Object.keys(r.players).length >= r.cfg.maxPlayers) return cb({ ok: false, err: 'Full' });
-    if (r.state === 'playing') return cb({ ok: false, err: 'Game in progress' });
-    roomId = rid; pName = name || 'Player';
-    joinRoom(socket, r, pName);
-    cb({ ok: true, roomId: rid });
+  socket.on('join', (data, cb) => {
+    const id = data.id.toUpperCase();
+    const r = rooms[id];
+    if (!r) return cb({ ok: false, msg: 'Not found' });
+    if (Object.keys(r.players).length >= 16) return cb({ ok: false, msg: 'Full' });
+    if (r.state === 'playing') return cb({ ok: false, msg: 'Started' });
+    room = id;
+    join(socket, r, data.name || 'Player', false);
+    cb({ ok: true, id });
   });
 
-  socket.on('startGame', () => {
-    if (!roomId) return;
-    const r = rooms[roomId];
-    const p = r.players[socket.id];
-    if (!p?.isHost) return;
-    const count = Object.keys(r.players).length;
-    const min = r.type === 'zombie' ? 1 : 2;
-    if (count < min) return socket.emit('toast', `Need ${min}+ players`);
-    startGame(r);
+  socket.on('start', () => {
+    if (!room || !rooms[room]) return;
+    const r = rooms[room];
+    if (!r.players[socket.id]?.host) return;
+    begin(r);
   });
 
-  socket.on('input', (inp) => {
-    if (!roomId) return;
-    const r = rooms[roomId];
-    const p = r?.players[socket.id];
-    if (p && r.state === 'playing') p.input = inp;
+  socket.on('input', (data) => {
+    if (!room || !rooms[room]) return;
+    const p = rooms[room].players[socket.id];
+    if (!p || !p.alive) return;
+    p.mx = data.mx || 0;
+    p.mz = data.mz || 0;
+    p.ry = data.ry || 0;
+    if (data.jump && p.grounded) { p.vy = 8; p.grounded = false; }
   });
 
   socket.on('shoot', (data) => {
-    if (!roomId) return;
-    const r = rooms[roomId];
-    const p = r?.players[socket.id];
-    if (!p || !p.alive || r.state !== 'playing') return;
+    if (!room || !rooms[room]) return;
+    const r = rooms[room];
+    const p = r.players[socket.id];
+    if (!p || !p.alive) return;
     const now = Date.now();
-    if (now - (p.lastShot || 0) < (p.fireRate || r.cfg.fireRate)) return;
+    if (now - p.lastShot < 200) return;
     p.lastShot = now;
-    r.projectiles.push({
-      id: uuid().slice(0, 6), x: p.x, y: p.y,
-      vx: Math.cos(data.angle) * (p.bulletSpeed || r.cfg.bulletSpeed),
-      vy: Math.sin(data.angle) * (p.bulletSpeed || r.cfg.bulletSpeed),
-      owner: socket.id, team: p.team, dmg: p.dmg || 20, life: 55
+    const speed = 80;
+    r.bullets.push({
+      x: p.x, y: p.y + 1.5, z: p.z,
+      vx: data.dx * speed, vy: data.dy * speed, vz: data.dz * speed,
+      owner: socket.id, team: p.team, life: 40
     });
   });
 
   socket.on('disconnect', () => {
-    if (!roomId || !rooms[roomId]) return;
-    const r = rooms[roomId];
+    if (!room || !rooms[room]) return;
+    const r = rooms[room];
     delete r.players[socket.id];
-    io.to(roomId).emit('roomUpdate', roomState(r));
-    if (Object.keys(r.players).length === 0) {
-      clearInterval(r.loop);
-      delete rooms[roomId];
+    io.to(room).emit('lobby', lobbyState(r));
+    if (!Object.keys(r.players).length) {
+      if (r.loop) clearInterval(r.loop);
+      delete rooms[room];
     }
   });
 });
 
-function joinRoom(socket, r, name) {
+function join(socket, r, name, host) {
   socket.join(r.id);
-  const host = Object.keys(r.players).length === 0;
   r.players[socket.id] = {
-    id: socket.id, name, isHost: host,
-    x: 0, y: 0, vx: 0, vy: 0, radius: 16,
-    hp: r.cfg.hp, maxHp: r.cfg.hp,
+    id: socket.id, name, host,
+    x: rnd(-40, 40), y: 0, z: rnd(-40, 40),
+    vx: 0, vy: 0, vz: 0,
+    ry: 0, mx: 0, mz: 0,
+    hp: 100, maxHp: 100, alive: true,
+    team: null, color: '#' + Math.floor(Math.random()*0xffffff).toString(16).padStart(6,'0'),
     score: 0, kills: 0, deaths: 0,
-    team: null, color: rndColor(), angle: 0,
-    input: { mx: 0, my: 0 }, alive: true,
-    respawnAt: 0, lastShot: 0,
-    weapon: 'pistol', dmg: 20, fireRate: r.cfg.fireRate,
-    bulletSpeed: r.cfg.bulletSpeed,
-    hasFlag: null, shield: 0, speedBoost: 0
+    lastShot: 0, respawnAt: 0, grounded: true
   };
-  io.to(r.id).emit('roomUpdate', roomState(r));
-  socket.emit('joined', { roomId: r.id, pid: socket.id });
+  io.to(r.id).emit('lobby', lobbyState(r));
+  socket.emit('me', socket.id);
 }
 
-function roomState(r) {
-  return {
-    id: r.id, type: r.type, state: r.state,
-    players: Object.values(r.players).map(p => ({
-      id: p.id, name: p.name, isHost: p.isHost
-    }))
+function lobbyState(r) {
+  return { id: r.id, type: r.type, state: r.state,
+    list: Object.values(r.players).map(p => ({ id: p.id, name: p.name, host: p.host }))
   };
 }
 
-// ===================== START GAME =====================
-function startGame(r) {
+function begin(r) {
   r.state = 'playing';
-  r.tick = 0;
-  r.startTime = Date.now();
-  r.projectiles = [];
-  r.pickups = [];
-  r.entities = [];
-  r.teamScores = { red: 0, blue: 0 };
-  const c = r.cfg;
+  r.bullets = []; r.items = []; r.zombies = [];
+  r.scores = { red: 0, blue: 0 }; r.wave = 0;
   const ids = Object.keys(r.players);
 
-  // Team assignment
-  const teamGames = ['teamshooter', 'ctf', 'koth'];
-  if (teamGames.includes(r.type)) {
+  if (r.type === 'team' || r.type === 'ctf') {
     ids.forEach((id, i) => {
-      r.players[id].team = i < c.perTeam ? 'red' : 'blue';
-      r.players[id].color = i < c.perTeam ? '#ff4466' : '#4488ff';
+      r.players[id].team = i < Math.ceil(ids.length/2) ? 'red' : 'blue';
+      r.players[id].color = r.players[id].team === 'red' ? '#ff4466' : '#4488ff';
     });
   }
 
-  // Spawn players
   ids.forEach(id => {
     const p = r.players[id];
-    spawnPlayer(r, p);
+    p.x = rnd(-60, 60); p.y = 0; p.z = rnd(-60, 60);
+    p.hp = 100; p.alive = true; p.score = 0; p.kills = 0; p.deaths = 0;
   });
 
-  // Game-specific init
-  if (r.type === 'battleroyale') initBR(r);
-  if (r.type === 'ctf') initCTF(r);
-  if (r.type === 'deathmatch') initDM(r);
-  if (r.type === 'koth') initKOTH(r);
-  if (r.type === 'zombie') initZombie(r);
-
-  io.to(r.id).emit('gameStart', {
-    type: r.type, cfg: c,
-    entities: r.entities, pickups: r.pickups,
-    zone: r.zone, flags: r.flags, hill: r.hill
-  });
-
-  r.loop = setInterval(() => tick(r), TICK);
-}
-
-function spawnPlayer(r, p) {
-  const c = r.cfg;
-  if (r.type === 'ctf' || r.type === 'koth' || r.type === 'teamshooter') {
-    const isRed = p.team === 'red';
-    p.x = isRed ? 100 + Math.random() * 200 : c.mapW - 300 + Math.random() * 200;
-    p.y = Math.random() * c.mapH;
-  } else {
-    p.x = 100 + Math.random() * (c.mapW - 200);
-    p.y = 100 + Math.random() * (c.mapH - 200);
+  if (r.type === 'battle') {
+    r.zone = { x: 0, z: 0, r: 120, tr: 120, tx: 0, tz: 0, next: Date.now() + 25000 };
   }
-  p.hp = c.hp; p.maxHp = c.hp;
-  p.alive = true; p.hasFlag = null;
-  p.weapon = 'pistol'; p.dmg = 20;
-  p.fireRate = c.fireRate; p.bulletSpeed = c.bulletSpeed;
-  p.shield = 0; p.speedBoost = 0;
-}
 
-// ===================== GAME INIT =====================
-function initBR(r) {
-  const c = r.cfg;
-  r.zone = {
-    x: c.mapW / 2, y: c.mapH / 2,
-    radius: Math.max(c.mapW, c.mapH),
-    targetR: Math.max(c.mapW, c.mapH),
-    tx: c.mapW / 2, ty: c.mapH / 2,
-    nextShrink: Date.now() + c.zoneShrink
-  };
-  const weps = ['shotgun', 'rifle', 'sniper', 'smg'];
-  for (let i = 0; i < c.weaponSpawns; i++) {
-    r.pickups.push({
-      id: uuid().slice(0, 6), type: 'weapon',
-      weapon: weps[Math.floor(Math.random() * weps.length)],
-      x: Math.random() * c.mapW, y: Math.random() * c.mapH, radius: 12
-    });
+  for (let i = 0; i < 15; i++) {
+    r.items.push({ x: rnd(-80, 80), y: 0.5, z: rnd(-80, 80), type: 'hp' });
   }
-  for (let i = 0; i < c.healthSpawns; i++) {
-    r.pickups.push({
-      id: uuid().slice(0, 6), type: 'health', heal: 40,
-      x: Math.random() * c.mapW, y: Math.random() * c.mapH, radius: 10
-    });
-  }
+
+  io.to(r.id).emit('start', { type: r.type, map: MAP });
+  r.loop = setInterval(() => tick(r), 1000 / 30);
 }
 
-function initCTF(r) {
-  const c = r.cfg;
-  r.flags = {
-    red: { x: 80, y: c.mapH / 2, home: true, carrier: null, color: '#ff4466' },
-    blue: { x: c.mapW - 80, y: c.mapH / 2, home: true, carrier: null, color: '#4488ff' }
-  };
-}
-
-function initDM(r) {
-  r.lastPowerup = Date.now();
-}
-
-function initKOTH(r) {
-  const c = r.cfg;
-  r.hill = {
-    x: c.mapW / 2, y: c.mapH / 2,
-    radius: c.hillRadius,
-    tx: c.mapW / 2, ty: c.mapH / 2,
-    nextMove: Date.now() + c.hillMoveInterval
-  };
-}
-
-function initZombie(r) {
-  r.wave = 0;
-  r.waveTimer = Date.now() + 3000;
-  r.zombiesAlive = 0;
-  r.entities = [];
-}
-
-// ===================== GAME TICK =====================
 function tick(r) {
   if (r.state !== 'playing') return;
-  r.tick++;
-  const c = r.cfg;
 
-  // Move players
-  Object.values(r.players).forEach(p => {
+  for (const p of Object.values(r.players)) {
     if (!p.alive) {
-      if (p.respawnAt && Date.now() > p.respawnAt && r.type !== 'battleroyale' && r.type !== 'zombie') {
-        spawnPlayer(r, p);
+      if (p.respawnAt && Date.now() > p.respawnAt && r.type !== 'battle') {
+        p.alive = true; p.hp = 100;
+        p.x = rnd(-40, 40); p.y = 0; p.z = rnd(-40, 40);
+        p.respawnAt = 0;
       }
-      return;
+      continue;
     }
-    const spd = (c.speed + (p.speedBoost > Date.now() ? 2 : 0));
-    if (p.input) {
-      let mx = p.input.mx || 0, my = p.input.my || 0;
-      const mag = Math.sqrt(mx * mx + my * my) || 1;
-      p.x += (mx / mag) * spd;
-      p.y += (my / mag) * spd;
-      p.angle = Math.atan2(my, mx);
-    }
-    p.x = Math.max(p.radius, Math.min(c.mapW - p.radius, p.x));
-    p.y = Math.max(p.radius, Math.min(c.mapH - p.radius, p.y));
-  });
 
-  // Projectiles
-  r.projectiles = r.projectiles.filter(b => {
-    b.x += b.vx; b.y += b.vy; b.life--;
-    if (b.life <= 0 || b.x < 0 || b.x > c.mapW || b.y < 0 || b.y > c.mapH) return false;
+    const spd = 0.35;
+    const sin = Math.sin(p.ry), cos = Math.cos(p.ry);
+    const fx = p.mx * cos - p.mz * sin;
+    const fz = p.mx * sin + p.mz * cos;
+    p.x += fx * spd;
+    p.z += fz * spd;
 
-    // Hit players
+    // Gravity
+    p.vy -= 0.4;
+    p.y += p.vy * 0.05;
+    if (p.y <= 0) { p.y = 0; p.vy = 0; p.grounded = true; }
+
+    p.x = Math.max(-MAP/2, Math.min(MAP/2, p.x));
+    p.z = Math.max(-MAP/2, Math.min(MAP/2, p.z));
+  }
+
+  r.bullets = r.bullets.filter(b => {
+    b.x += b.vx * 0.033; b.y += b.vy * 0.033; b.z += b.vz * 0.033;
+    b.life--;
+    if (b.life <= 0 || b.y < 0) return false;
+
     for (const p of Object.values(r.players)) {
       if (!p.alive || p.id === b.owner) continue;
       if (p.team && p.team === b.team) continue;
-      if (dist(p, b) < p.radius + 4) {
-        let dmg = b.dmg;
-        if (p.shield > Date.now()) dmg *= 0.3;
-        p.hp -= dmg;
-        if (p.hp <= 0) killPlayer(r, p, b.owner);
+      if (d3(p, b) < 2) {
+        p.hp -= 18;
+        if (p.hp <= 0) {
+          p.alive = false; p.deaths++;
+          const k = r.players[b.owner];
+          if (k) { k.kills++; k.score += 100; }
+          if (r.type === 'battle') {
+            const alive = Object.values(r.players).filter(pp => pp.alive);
+            if (alive.length <= 1) return end(r, alive[0]?.id, null);
+          } else { p.respawnAt = Date.now() + 3000; }
+        }
         return false;
       }
     }
 
-    // Hit zombies
-    if (r.type === 'zombie') {
-      for (let i = r.entities.length - 1; i >= 0; i--) {
-        const z = r.entities[i];
-        if (z.type !== 'zombie') continue;
-        if (dist(z, b) < z.radius + 4) {
-          z.hp -= b.dmg;
-          if (z.hp <= 0) {
-            r.entities.splice(i, 1);
-            r.zombiesAlive--;
-            const killer = r.players[b.owner];
-            if (killer) { killer.score += 10; killer.kills++; }
-          }
-          return false;
+    for (let i = r.zombies.length - 1; i >= 0; i--) {
+      const z = r.zombies[i];
+      if (d3(z, b) < 2) {
+        z.hp -= 18;
+        if (z.hp <= 0) {
+          r.zombies.splice(i, 1);
+          const k = r.players[b.owner];
+          if (k) { k.kills++; k.score += 10; }
         }
+        return false;
       }
     }
     return true;
   });
 
-  // Game-specific
-  if (r.type === 'battleroyale') tickBR(r);
-  if (r.type === 'teamshooter') tickTDM(r);
-  if (r.type === 'ctf') tickCTF(r);
-  if (r.type === 'zombie') tickZombie(r);
-  if (r.type === 'deathmatch') tickDM(r);
-  if (r.type === 'koth') tickKOTH(r);
+  if (r.type === 'battle' && r.zone) {
+    const z = r.zone;
+    if (Date.now() > z.next && z.tr > 15) {
+      z.tr *= 0.6;
+      z.tx = rnd(-20, 20); z.tz = rnd(-20, 20);
+      z.next = Date.now() + 25000;
+    }
+    z.r += (z.tr - z.r) * 0.008;
+    z.x += (z.tx - z.x) * 0.008;
+    z.z += (z.tz - z.z) * 0.008;
+    for (const p of Object.values(r.players)) {
+      if (!p.alive) continue;
+      const dd = Math.sqrt((p.x-z.x)**2 + (p.z-z.z)**2);
+      if (dd > z.r) { p.hp -= 0.4; if (p.hp <= 0) { p.alive = false; p.deaths++; } }
+    }
+  }
 
-  // Broadcast
-  const state = { players: {}, projectiles: r.projectiles, pickups: r.pickups, entities: r.entities, zone: r.zone, flags: r.flags, hill: r.hill, teamScores: r.teamScores, wave: r.wave, tick: r.tick };
-  Object.values(r.players).forEach(p => {
-    state.players[p.id] = {
-      x: p.x, y: p.y, radius: p.radius, hp: p.hp, maxHp: p.maxHp,
-      score: p.score, kills: p.kills, deaths: p.deaths,
-      name: p.name, color: p.color, angle: p.angle,
-      alive: p.alive, team: p.team, weapon: p.weapon,
-      hasFlag: p.hasFlag, shield: p.shield > Date.now()
-    };
+  if (r.type === 'team') {
+    r.scores.red = Object.values(r.players).filter(p => p.team==='red').reduce((s,p) => s+p.kills, 0);
+    r.scores.blue = Object.values(r.players).filter(p => p.team==='blue').reduce((s,p) => s+p.kills, 0);
+    if (r.scores.red >= 20) end(r, null, 'red');
+    if (r.scores.blue >= 20) end(r, null, 'blue');
+  }
+
+  if (r.type === 'zombie') {
+    const alive = Object.values(r.players).filter(p => p.alive);
+    if (r.zombies.length === 0 && Date.now() > (r.waveTimer || 0)) {
+      r.wave++;
+      for (let i = 0; i < 4 + r.wave * 3; i++) {
+        const a = Math.random() * Math.PI * 2;
+        r.zombies.push({
+          x: Math.cos(a) * 90, y: 0, z: Math.sin(a) * 90,
+          hp: 30 + r.wave * 8, speed: 0.06 + r.wave * 0.005, lastAtk: 0
+        });
+      }
+      r.waveTimer = Date.now() + 999999;
+    }
+    r.zombies.forEach(z => {
+      let near = null, nd = Infinity;
+      alive.forEach(p => { const d = d3(p, z); if (d < nd) { nd = d; near = p; } });
+      if (near) {
+        const dx = near.x - z.x, dz = near.z - z.z;
+        const d = Math.sqrt(dx*dx + dz*dz) || 1;
+        z.x += (dx/d) * z.speed; z.z += (dz/d) * z.speed;
+        if (d < 2.5 && Date.now() - z.lastAtk > 800) {
+          z.lastAtk = Date.now(); near.hp -= 8;
+          if (near.hp <= 0) { near.alive = false; near.deaths++; }
+        }
+      }
+    });
+    if (alive.length === 0 && r.wave > 0) end(r, null, null, r.wave);
+    if (r.zombies.length === 0 && r.wave > 0) {
+      r.waveTimer = Date.now() + 4000;
+      alive.forEach(p => p.hp = Math.min(100, p.hp + 20));
+    }
+  }
+
+  r.items = r.items.filter(it => {
+    for (const p of Object.values(r.players)) {
+      if (!p.alive) continue;
+      if (d3(p, it) < 2.5) {
+        if (it.type === 'hp') p.hp = Math.min(100, p.hp + 30);
+        return false;
+      }
+    }
+    return true;
   });
+
+  const state = { players: {}, bullets: r.bullets, items: r.items, zombies: r.zombies, zone: r.zone, scores: r.scores, wave: r.wave };
+  for (const p of Object.values(r.players)) {
+    state.players[p.id] = {
+      x: p.x, y: p.y, z: p.z, ry: p.ry,
+      hp: p.hp, maxHp: p.maxHp, alive: p.alive,
+      team: p.team, color: p.color, name: p.name,
+      score: p.score, kills: p.kills, deaths: p.deaths
+    };
+  }
   io.to(r.id).emit('state', state);
 }
 
-function killPlayer(r, victim, killerId) {
-  victim.alive = false;
-  victim.deaths++;
-  victim.hp = 0;
-  const killer = r.players[killerId];
-  if (killer) { killer.kills++; killer.score += 100; }
-
-  // Drop flag
-  if (victim.hasFlag) {
-    const flag = r.flags[victim.hasFlag];
-    if (flag) {
-      flag.carrier = null;
-      flag.x = victim.x;
-      flag.y = victim.y;
-      flag.home = false;
-      flag.dropTime = Date.now();
-    }
-    victim.hasFlag = null;
-  }
-
-  if (r.type === 'battleroyale') {
-    const alive = Object.values(r.players).filter(p => p.alive);
-    if (alive.length <= 1) endGame(r, alive[0]?.id);
-  } else {
-    victim.respawnAt = Date.now() + (r.cfg.respawn || 3000);
-  }
-}
-
-// ===================== BR =====================
-function tickBR(r) {
-  const c = r.cfg, z = r.zone;
-  if (!z) return;
-  if (Date.now() > z.nextShrink && z.targetR > 80) {
-    z.targetR *= 0.6;
-    z.tx = c.mapW / 2 + (Math.random() - 0.5) * z.targetR * 0.3;
-    z.ty = c.mapH / 2 + (Math.random() - 0.5) * z.targetR * 0.3;
-    z.nextShrink = Date.now() + c.zoneShrink;
-  }
-  z.radius += (z.targetR - z.radius) * 0.008;
-  z.x += (z.tx - z.x) * 0.008;
-  z.y += (z.ty - z.y) * 0.008;
-
-  Object.values(r.players).forEach(p => {
-    if (!p.alive) return;
-    if (dist(p, z) > z.radius) {
-      p.hp -= c.zoneDmg * (TICK / 1000);
-      if (p.hp <= 0) killPlayer(r, p, null);
-    }
-  });
-
-  r.pickups = r.pickups.filter(pk => {
-    for (const p of Object.values(r.players)) {
-      if (!p.alive) continue;
-      if (dist(p, pk) < p.radius + pk.radius) {
-        if (pk.type === 'health') p.hp = Math.min(p.maxHp, p.hp + pk.heal);
-        if (pk.type === 'weapon') {
-          p.weapon = pk.weapon;
-          p.dmg = { shotgun: 35, rifle: 15, sniper: 55, smg: 10 }[pk.weapon];
-          p.fireRate = { shotgun: 700, rifle: 180, sniper: 1100, smg: 90 }[pk.weapon];
-          p.bulletSpeed = { shotgun: 10, rifle: 14, sniper: 18, smg: 13 }[pk.weapon];
-        }
-        return false;
-      }
-    }
-    return true;
-  });
-}
-
-function tickTDM(r) {
-  r.teamScores.red = Object.values(r.players).filter(p => p.team === 'red').reduce((s, p) => s + p.kills, 0);
-  r.teamScores.blue = Object.values(r.players).filter(p => p.team === 'blue').reduce((s, p) => s + p.kills, 0);
-  if (r.teamScores.red >= r.cfg.scoreToWin) endGame(r, null, 'red');
-  if (r.teamScores.blue >= r.cfg.scoreToWin) endGame(r, null, 'blue');
-}
-
-// ===================== CTF =====================
-function tickCTF(r) {
-  const c = r.cfg, f = r.flags;
-  if (!f) return;
-
-  ['red', 'blue'].forEach(team => {
-    const flag = f[team];
-    // Auto-return dropped flag
-    if (!flag.home && !flag.carrier && flag.dropTime && Date.now() - flag.dropTime > c.flagReturnTime) {
-      flag.home = true;
-      flag.x = team === 'red' ? 80 : c.mapW - 80;
-      flag.y = c.mapH / 2;
-    }
-
-    // Pickup enemy flag
-    const enemy = team === 'red' ? 'blue' : 'red';
-    Object.values(r.players).forEach(p => {
-      if (!p.alive || p.team !== team || p.hasFlag) return;
-      const ef = f[enemy];
-      if (!ef.carrier && dist(p, ef) < p.radius + 20) {
-        ef.carrier = p.id;
-        p.hasFlag = enemy;
-      }
-    });
-
-    // Capture
-    Object.values(r.players).forEach(p => {
-      if (!p.alive || p.hasFlag !== enemy) return;
-      const homeFlag = f[team];
-      if (homeFlag.home && dist(p, homeFlag) < 50) {
-        r.teamScores[team]++;
-        p.hasFlag = null;
-        f[enemy].carrier = null;
-        f[enemy].home = true;
-        f[enemy].x = enemy === 'red' ? 80 : c.mapW - 80;
-        f[enemy].y = c.mapH / 2;
-        p.score += 500;
-        if (r.teamScores[team] >= c.capturesToWin) endGame(r, null, team);
-      }
-    });
-
-    // Move flag with carrier
-    if (flag.carrier) {
-      const carrier = r.players[flag.carrier];
-      if (carrier?.alive) {
-        flag.x = carrier.x;
-        flag.y = carrier.y;
-      } else {
-        flag.carrier = null;
-        flag.dropTime = Date.now();
-        if (carrier) carrier.hasFlag = null;
-      }
-    }
-  });
-}
-
-// ===================== ZOMBIE =====================
-function tickZombie(r) {
-  const c = r.cfg;
-  if (Date.now() > r.waveTimer && r.zombiesAlive <= 0) {
-    r.wave++;
-    const count = c.zombiesPerWave + (r.wave - 1) * c.waveGrowth;
-    for (let i = 0; i < count; i++) {
-      const side = Math.floor(Math.random() * 4);
-      let x, y;
-      if (side === 0) { x = Math.random() * c.mapW; y = -20; }
-      else if (side === 1) { x = c.mapW + 20; y = Math.random() * c.mapH; }
-      else if (side === 2) { x = Math.random() * c.mapW; y = c.mapH + 20; }
-      else { x = -20; y = Math.random() * c.mapH; }
-
-      const isBoss = r.wave >= 3 && Math.random() < 0.1;
-      r.entities.push({
-        id: uuid().slice(0, 6), type: 'zombie',
-        x, y, radius: isBoss ? 24 : 12,
-        hp: isBoss ? c.zombieHp * 5 : c.zombieHp + r.wave * 5,
-        maxHp: isBoss ? c.zombieHp * 5 : c.zombieHp + r.wave * 5,
-        speed: isBoss ? c.zombieSpeed * 0.6 : c.zombieSpeed + r.wave * 0.08,
-        dmg: isBoss ? c.zombieDmg * 3 : c.zombieDmg,
-        color: isBoss ? '#ff0000' : '#44aa44',
-        lastAttack: 0
-      });
-      r.zombiesAlive++;
-    }
-    r.waveTimer = Date.now() + 999999;
-  }
-
-  // Check wave clear
-  if (r.zombiesAlive <= 0 && r.wave > 0) {
-    r.waveTimer = Date.now() + c.waveInterval;
-    // Heal players between waves
-    Object.values(r.players).forEach(p => {
-      if (p.alive) p.hp = Math.min(p.maxHp, p.hp + 30);
-    });
-  }
-
-  // Move zombies toward nearest player
-  r.entities.forEach(z => {
-    if (z.type !== 'zombie') return;
-    let nearest = null, nearDist = Infinity;
-    Object.values(r.players).forEach(p => {
-      if (!p.alive) return;
-      const d = dist(p, z);
-      if (d < nearDist) { nearDist = d; nearest = p; }
-    });
-    if (nearest) {
-      const dx = nearest.x - z.x, dy = nearest.y - z.y;
-      const d = Math.sqrt(dx * dx + dy * dy) || 1;
-      z.x += (dx / d) * z.speed;
-      z.y += (dy / d) * z.speed;
-
-      // Attack
-      if (d < nearest.radius + z.radius + 4 && Date.now() - z.lastAttack > 800) {
-        z.lastAttack = Date.now();
-        nearest.hp -= z.dmg;
-        if (nearest.hp <= 0) {
-          nearest.alive = false;
-          nearest.deaths++;
-          // In zombie mode, dead players spectate until next wave
-          nearest.respawnAt = Date.now() + 999999;
-        }
-      }
-    }
-  });
-
-  // Check all dead
-  const alive = Object.values(r.players).filter(p => p.alive);
-  if (alive.length === 0 && r.wave > 0) {
-    endGame(r, null, null, r.wave);
-  }
-}
-
-// ===================== DEATHMATCH =====================
-function tickDM(r) {
-  const c = r.cfg;
-  // Powerups
-  if (Date.now() - (r.lastPowerup || 0) > c.powerupInterval) {
-    r.lastPowerup = Date.now();
-    const types = ['speed', 'shield', 'damage', 'rapid'];
-    r.pickups.push({
-      id: uuid().slice(0, 6), type: 'powerup',
-      power: types[Math.floor(Math.random() * types.length)],
-      x: 100 + Math.random() * (c.mapW - 200),
-      y: 100 + Math.random() * (c.mapH - 200),
-      radius: 14
-    });
-  }
-
-  r.pickups = r.pickups.filter(pk => {
-    for (const p of Object.values(r.players)) {
-      if (!p.alive) continue;
-      if (dist(p, pk) < p.radius + pk.radius) {
-        if (pk.type === 'powerup') {
-          const dur = 8000;
-          if (pk.power === 'speed') p.speedBoost = Date.now() + dur;
-          if (pk.power === 'shield') p.shield = Date.now() + dur;
-          if (pk.power === 'damage') { p.dmg = 45; setTimeout(() => { if (r.players[p.id]) r.players[p.id].dmg = 20; }, dur); }
-          if (pk.power === 'rapid') { p.fireRate = 60; setTimeout(() => { if (r.players[p.id]) r.players[p.id].fireRate = c.fireRate; }, dur); }
-          p.score += 25;
-        }
-        return false;
-      }
-    }
-    return true;
-  });
-
-  // Win check
-  for (const p of Object.values(r.players)) {
-    if (p.kills >= c.scoreToWin) endGame(r, p.id);
-  }
-}
-
-// ===================== KOTH =====================
-function tickKOTH(r) {
-  const c = r.cfg, h = r.hill;
-  if (!h) return;
-
-  // Move hill
-  if (Date.now() > h.nextMove) {
-    h.tx = 200 + Math.random() * (c.mapW - 400);
-    h.ty = 200 + Math.random() * (c.mapH - 400);
-    h.nextMove = Date.now() + c.hillMoveInterval;
-  }
-  h.x += (h.tx - h.x) * 0.01;
-  h.y += (h.ty - h.y) * 0.01;
-
-  // Score for team in hill
-  const inHill = { red: 0, blue: 0 };
-  Object.values(r.players).forEach(p => {
-    if (!p.alive || !p.team) return;
-    if (dist(p, h) < h.radius) inHill[p.team]++;
-  });
-
-  if (inHill.red > 0 && inHill.blue === 0) r.teamScores.red += 0.05;
-  if (inHill.blue > 0 && inHill.red === 0) r.teamScores.blue += 0.05;
-
-  if (r.teamScores.red >= c.scoreToWin) endGame(r, null, 'red');
-  if (r.teamScores.blue >= c.scoreToWin) endGame(r, null, 'blue');
-}
-
-// ===================== END =====================
-function endGame(r, winnerId, winnerTeam, waveReached) {
+function end(r, wid, wteam, wave) {
   r.state = 'ended';
-  clearInterval(r.loop);
-  io.to(r.id).emit('gameEnd', {
-    winnerId, winnerTeam, waveReached,
-    players: Object.values(r.players).map(p => ({
-      id: p.id, name: p.name, score: p.score,
-      kills: p.kills, deaths: p.deaths, team: p.team
-    })).sort((a, b) => b.score - a.score)
+  if (r.loop) clearInterval(r.loop);
+  io.to(r.id).emit('end', {
+    winnerId: wid, winnerTeam: wteam, wave,
+    list: Object.values(r.players).map(p => ({
+      id: p.id, name: p.name, score: p.score, kills: p.kills, deaths: p.deaths, team: p.team
+    })).sort((a,b) => b.score - a.score)
   });
 }
 
-// ===================== UTILS =====================
-function dist(a, b) { return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2); }
-function rndColor() {
-  const c = ['#ff4466', '#00f0ff', '#00ff88', '#ffaa00', '#aa44ff', '#ff88cc', '#44ddff', '#ffdd44'];
-  return c[Math.floor(Math.random() * c.length)];
-}
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🎮 GAMEVERSE on http://localhost:${PORT}`));
+server.listen(3000, () => console.log('🎮 GAMEVERSE 3D: http://localhost:3000'));
